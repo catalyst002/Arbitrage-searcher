@@ -1,100 +1,51 @@
 import asyncio
-import json
-import sqlite3 as sl
-from decimal import Decimal, getcontext
 import aiohttp
+import sqlite3 as sl
+from aiogram import Bot
 
-# Set decimal precision
-getcontext().prec = 3
+# Configuration (Consider moving these to a separate config file or environment variables)
+BOT_TOKEN = ""
+CONV_WITH_BOT_ID = 6666666666
+COINS_API_URL = "https://api.coingecko.com/api/v3/coins/{}"
 
-# Initialize database connection
+# Initialize bot and database connection
+bot = Bot(token=BOT_TOKEN)
 db = sl.connect('test.db')
 
-
-def setup_database():
-    with db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS deals (
-                xsymbol TEXT,
-                ysymbol TEXT,
-                xchangename TEXT,
-                ychangename TEXT,
-                diff REAL
-            );
-        """)
-
-
-def insert_data(coinname, xsymbol, ysymbol, xchangename, ychangename, diffcheck):
-    with db:
-        sql = 'INSERT INTO deals (xsymbol, ysymbol, xchangename, ychangename, diff) VALUES (?, ?, ?, ?, ?)'
-        db.execute(sql, (xsymbol, ysymbol, xchangename, ychangename, diffcheck))
-
-
-def get_proxy(proxies, counter):
-    return proxies[counter % len(proxies)]
-
-
-async def fetch_coin_data(session, coin, proxy):
-    url = f'https://api.cryptorank.io/v0/coins/{coin}/tickers?includeQuote=false'
-    async with session.get(url, proxy=f"http://{proxy}") as response:
+async def fetch_coin_data(session, coin_name):
+    async with session.get(COINS_API_URL.format(coin_name)) as response:
         return await response.json()
 
+async def send_message(message):
+    await bot.send_message(CONV_WITH_BOT_ID, message)
 
-async def process_coins(minspread, maxspread, proxies):
-    setup_database()
+def update_price_in_db(dbcoinname, base, target, platform, newprice):
+    with db:
+        result = db.execute('SELECT price FROM {} WHERE pair = ? AND platform = ?'.format(dbcoinname), 
+                            (f"{base}/{target}", platform)).fetchone()
+        if result:
+            oldprice = result[0]
+            # Calculate price change and decide if a message should be sent
+        else:
+            # Insert new price if pair does not exist
+            db.execute('INSERT INTO {} (pair, platform, price) VALUES (?, ?, ?)'.format(dbcoinname),
+                       (f"{base}/{target}", platform, newprice))
 
-    with open('coins.txt', 'r') as f, open('proxy.txt', 'r') as p:
-        coins = f.read().splitlines()
-        proxies = p.read().splitlines()
-
+async def process_coin(coin_name):
     async with aiohttp.ClientSession() as session:
-        for idx, coin in enumerate(coins):
-            proxy = get_proxy(proxies, idx)
-            jsonresp = await fetch_coin_data(session, coin, proxy)
-            dataarray = jsonresp.get('data', [])
-            await compare_prices(minspread, maxspread, dataarray)
-
-
-async def compare_prices(minspread, maxspread, dataarray):
-    for x in dataarray:
-        for y in dataarray:
-            try:
-                diffcheck = calculate_diffcheck(x, y)
-                if criteria_met(diffcheck, minspread, maxspread, x, y):
-                    insert_data(
-                        x['coinName'], x['symbol'], y['symbol'], x['exchangeName'],
-                        y['exchangeName'], diffcheck
-                    )
-            except (ZeroDivisionError, KeyError):
-                continue
-
-
-def calculate_diffcheck(x, y):
-    xprice, yprice = Decimal(x['usdLast']), Decimal(y['usdLast'])
-    diff = abs(xprice - yprice)
-    percent = (diff / xprice) * 100
-    totalspread = x.get('spread', 0) + y.get('spread', 0)
-    return percent - totalspread
-
-
-def criteria_met(diffcheck, minspread, maxspread, x, y):
-    return (
-        minspread < diffcheck < maxspread and
-        x['exchangeName'] != y['exchangeName'] and
-        x['exchangeName'] in {'Binance', 'Kucoin', 'OKX', 'Huobi', 'MEXC Global'} and
-        y['exchangeGroup'] == 'dex' and
-        y['exchangeName'] != 'Raydium' and
-        x['to'] in {'USDT', 'BUSD', 'USDC'} and
-        y['usdVolume'] > 10000
-    )
-
+        coin_data = await fetch_coin_data(session, coin_name)
+        dbcoinname = coin_name.replace("-", "")
+        # Iterate through tickers and process them
+        for ticker in coin_data.get("tickers", []):
+            if ticker["market"]["name"] in ["Uniswap (v3)", "Uniswap (v2)", "Sushiswap"]: # Add more as needed
+                update_price_in_db(dbcoinname, ticker["base"], ticker["target"], ticker["market"]["name"], ticker["converted_last"]["usd"])
 
 async def main():
-    minspread = int(input("Input the min spread: "))
-    maxspread = int(input("Input the max spread: "))
-    await process_coins(minspread, maxspread, proxies)
+    with open("coins.txt", "r") as f:
+        coins = eval(f.read())[:101]  # Consider JSON for safer parsing
 
+    tasks = [process_coin(coin) for coin in coins]
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
